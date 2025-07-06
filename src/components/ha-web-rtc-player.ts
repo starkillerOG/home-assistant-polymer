@@ -348,6 +348,33 @@ class HaWebRtcPlayer extends LitElement {
       return;
     }
 
+    let lines = offer.sdp.split('\n')
+    let audio_section = false;
+    let found_msid = false;
+    let msid = "";
+    lines.forEach(function(line, index) {
+        if (line.indexOf('m=audio') === 0) {
+          audio_section = true;
+        }
+        if(line.indexOf('a=msid:')===0 && audio_section) {
+          line = line.replace("{", "").replace("}", "")
+          lines[index] = line
+          msid = line.replace("a=msid:", " msid:")
+          found_msid = true;
+        }
+        if(line.indexOf('a=ssrc:')===0 && audio_section && found_msid) {
+          line = line.replace("{", "").replace("}", "")
+          let ssrc = line.split(" cname")[0];
+          lines[index] = line + "\n" + ssrc + msid;
+        }
+        if (line.indexOf('m=video') === 0) {
+          audio_section = false;
+        }
+    });
+
+    let new_sdp = lines.join('\n');
+    offer.sdp = new_sdp;
+
     this._logEvent("end createOffer", offer);
 
     this._logEvent("start setLocalDescription");
