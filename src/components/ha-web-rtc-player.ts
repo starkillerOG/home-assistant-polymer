@@ -518,10 +518,19 @@ class HaWebRtcPlayer extends LitElement {
       return;
     }
 
+    let lines = event.answer.split('\n')
+    lines.forEach(function(line, index) {
+        if (line.indexOf('c=IN') === 0) {
+          lines[index] = line + "\n" + "a=extmap:3 urn:ietf:params:rtp-hdrext:sdes:mid";
+        }
+    });
+    let new_sdp = lines.join('\n');
+    console.error(new_sdp)
+
     // Initiate the stream with the remote device
     const remoteDesc = new RTCSessionDescription({
       type: "answer",
-      sdp: event.answer,
+      sdp: new_sdp,
     });
     try {
       this._logEvent("start setRemoteDescription", remoteDesc);
