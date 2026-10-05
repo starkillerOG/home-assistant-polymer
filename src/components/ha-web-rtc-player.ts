@@ -102,26 +102,54 @@ class HaWebRtcPlayer extends LitElement {
       );
       this._localReturnAudioTrack = tracks[0];
 
-      // The ice-ufrag and ice-pwd will change when changing from recvonly > sendrecv
-      // Therefore a ICE restart is required (firefox enforces, chrome accepts)
-      this._peerConnection!.restartIce();
-      this._candidatesList = [];
+      const transceiver = this._getAudioTransceiver();
+      if (transceiver) {
+        // Attach the microphone before changing the direction, so the
+        // renegotiation (triggered by the direction change) only adds sending
+        // to the existing audio transceiver. The peer connection, ICE and DTLS
+        // are kept, so the video continues without a restart.
+        await transceiver.sender.replaceTrack(this._localReturnAudioTrack);
+        transceiver.direction = "sendrecv";
 
-      // Find the audio transceiver
-      // Transceiver are in the order they were added, audio should be first
-      for (const transceiver of this._peerConnection!.getTransceivers()) {
-        if (transceiver.receiver.track.kind === "audio") {
-          transceiver!.sender.replaceTrack(this._localReturnAudioTrack);
-          transceiver!.direction = "sendrecv";
-
-          this._localReturnTrackAdded = true;
-          return;
-        }
+        this._localReturnTrackAdded = true;
+        return;
       }
     }
 
     this._logEvent("unable to add audio send track");
     this._twoWayAudio = false;
+    this.requestUpdate();
+  }
+
+  private _getAudioTransceiver(): RTCRtpTransceiver | undefined {
+    return this._peerConnection
+      ?.getTransceivers()
+      .find((transceiver) => transceiver.receiver.track.kind === "audio");
+  }
+
+  /**
+   * The camera did not accept the renegotiation for two way audio. Revert to
+   * the negotiated receive only audio, so the running stream keeps playing.
+   */
+  private async _revertLocalReturnAudio(message: string) {
+    this._logEvent("renegotiation failed", message);
+    this._reOfferPending = false;
+
+    const peerConnection = this._peerConnection;
+    if (peerConnection?.signalingState === "have-local-offer") {
+      await peerConnection.setLocalDescription({ type: "rollback" });
+    }
+
+    const transceiver = this._getAudioTransceiver();
+    if (transceiver) {
+      // Same as the negotiated direction, so no new negotiation is needed
+      transceiver.direction = "recvonly";
+      await transceiver.sender.replaceTrack(null);
+    }
+
+    this._localReturnAudioTrack?.stop();
+    this._localReturnAudioTrack = undefined;
+    this._localReturnTrackAdded = false;
     this.requestUpdate();
   }
 
@@ -176,6 +204,8 @@ class HaWebRtcPlayer extends LitElement {
   private _unsub?: Promise<UnsubscribeFunc>;
 
   private _sessionId?: string;
+
+  private _reOfferPending = false;
 
   private _candidatesList: RTCIceCandidate[] = [];
 
@@ -415,38 +445,49 @@ class HaWebRtcPlayer extends LitElement {
 
     this._logEvent("start webRtcOffer", offer_sdp);
 
+    if (this._sessionId) {
+      await this._sendReOffer(this._sessionId, offer_sdp);
+      return;
+    }
+
     try {
-      if (!this._sessionId) {
-        this._unsub = webRtcOffer(
-          this._connection,
-          this.entityid,
-          offer_sdp,
-          (event) => this._handleOfferEvent(event)
-        );
-      } else {
-        // The previous subscription owns the session on the backend and closes
-        // it when dropped, so hand ownership over before opening the new one.
-        const previousUnsub = this._unsub;
-        this._unsub = undefined;
-        await previousUnsub?.then((unsub) => unsub());
-
-        if (!this._peerConnection) {
-          return;
-        }
-
-        this._unsub = webRtcReOffer(
-          this._connection,
-          this.entityid,
-          offer_sdp,
-          (event) => this._handleOfferEvent(event),
-          this._sessionId
-        );
-      }
+      this._unsub = webRtcOffer(
+        this._connection,
+        this.entityid,
+        offer_sdp,
+        (event) => this._handleOfferEvent(event)
+      );
     } catch (err: any) {
       this._error = "Failed to start WebRTC stream: " + err.message;
       this._cleanUp();
     }
   };
+
+  private async _sendReOffer(sessionId: string, offerSdp: string) {
+    // Renegotiate the existing session, so the stream continues. The re-offer
+    // subscription takes over ownership of the session on the backend, so
+    // dropping the previous subscription afterwards does not close the session.
+    const previousUnsub = this._unsub;
+    const reOfferUnsub = webRtcReOffer(
+      this._connection,
+      this.entityid!,
+      offerSdp,
+      (event) => this._handleOfferEvent(event),
+      sessionId
+    );
+    this._reOfferPending = true;
+    this._unsub = reOfferUnsub;
+
+    try {
+      await reOfferUnsub;
+    } catch (err: any) {
+      // The previous subscription still owns the session
+      this._unsub = previousUnsub;
+      await this._revertLocalReturnAudio(err.message);
+      return;
+    }
+    previousUnsub?.then((unsub) => unsub());
+  }
 
   private _iceConnectionStateChanged = () => {
     this._logEvent(
@@ -512,6 +553,10 @@ class HaWebRtcPlayer extends LitElement {
       }
     }
     if (event.type === "error") {
+      if (this._reOfferPending) {
+        await this._revertLocalReturnAudio(event.message);
+        return;
+      }
       this._error = "Failed to start WebRTC stream: " + event.message;
       this._cleanUp();
     }
@@ -549,11 +594,17 @@ class HaWebRtcPlayer extends LitElement {
     if (event.track.kind === "audio" && this.muted) {
       return;
     }
-    this._remoteStream.addTrack(event.track);
+    if (!this._remoteStream.getTracks().includes(event.track)) {
+      this._remoteStream.addTrack(event.track);
+    }
     if (!this.hasUpdated) {
       await this.updateComplete;
     }
-    this._videoEl.srcObject = this._remoteStream;
+    // Re-assigning the same stream restarts the video element, which would
+    // cause a visible glitch on renegotiation
+    if (this._videoEl.srcObject !== this._remoteStream) {
+      this._videoEl.srcObject = this._remoteStream;
+    }
   };
 
   private async _handleAnswer(event: WebRtcAnswer) {
@@ -573,9 +624,15 @@ class HaWebRtcPlayer extends LitElement {
       this._logEvent("start setRemoteDescription", remoteDesc);
       await this._peerConnection.setRemoteDescription(remoteDesc);
     } catch (err: any) {
+      if (this._reOfferPending) {
+        // Keep the running stream if only the renegotiation failed
+        await this._revertLocalReturnAudio(err.message);
+        return;
+      }
       this._error = "Failed to connect WebRTC stream: " + err.message;
       this._cleanUp();
     }
+    this._reOfferPending = false;
     this._logEvent("end setRemoteDescription");
   }
 
@@ -602,7 +659,10 @@ class HaWebRtcPlayer extends LitElement {
     }
     if (this._localReturnAudioTrack) {
       this._localReturnAudioTrack.stop();
+      this._localReturnAudioTrack = undefined;
     }
+    this._localReturnTrackAdded = false;
+    this._reOfferPending = false;
     const videoEl = this._videoEl;
     if (videoEl) {
       videoEl.removeAttribute("src");
